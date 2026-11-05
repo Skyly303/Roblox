@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Roblox Gear ID Collector</title>
+<style>
+  :root { color-scheme: dark; --bg:#10131a; --panel:#191f2b; --line:#30394a; --text:#eef2f8; --muted:#aab5c5; --accent:#67a7ff; }
+  * { box-sizing:border-box }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font:15px/1.5 system-ui, sans-serif; }
+  main { max-width:850px; margin:auto; }
+  h1 { margin:0 0 6px; font-size:1.65rem; }
+  p,.muted { color:var(--muted); }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:18px; margin:16px 0; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  button { background:var(--accent); color:#071321; border:0; border-radius:9px; padding:10px 15px; font-weight:700; cursor:pointer; }
+  button.secondary { background:#303b4e; color:var(--text); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  input { background:#0e131c; color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px; width:110px; }
+  progress { width:100%; height:13px; accent-color:var(--accent); }
+  #status { min-height:1.5em; color:var(--muted); }
+  textarea { width:100%; min-height:250px; resize:vertical; background:#0b1018; color:#dce8f8; border:1px solid var(--line); border-radius:9px; padding:12px; font:13px ui-monospace,monospace; }
+  .stat { font-size:1.4rem; font-weight:750; }
+  code { color:#c4dcff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Roblox Gear ID Collector</h1>
+  <p>Collects publicly searchable, non-weapon catalog entries identified as classic Gear (asset type 19), then saves unique IDs as plain text.</p>
+
+  <section class="panel">
+    <div class="row">
+      <label>Results per request <input id="batch" type="number" min="10" max="30" value="30"></label>
+      <label>Maximum pages <input id="pages" type="number" min="1" max="1000" value="100"></label>
+    </div>
+    <p class="muted">The page limit is a safety stop, not a promise that all Roblox Gear can be found. The collector excludes entries whose names or descriptions match a basic weapon-related keyword filter; this filter is imperfect.</p>
+    <div class="row">
+      <button id="start">Start collecting</button>
+      <button id="pause" class="secondary" disabled>Pause</button>
+      <button id="resume" class="secondary" disabled>Resume</button>
+      <button id="download" class="secondary">Download IDs (.txt)</button>
+      <button id="clear" class="secondary">Clear saved IDs</button>
+    </div>
+    <p id="status" role="status">Ready. Your collected IDs are saved in this browser while you work.</p>
+    <progress id="progress" max="100" value="0"></progress>
+    <div class="row" style="justify-content:space-between;margin-top:8px">
+      <div><div class="stat" id="count">0</div><div class="muted">unique IDs saved</div></div>
+      <div><div class="stat" id="pageCount">0</div><div class="muted">pages processed this run</div></div>
+      <div><div class="stat" id="skipCount">0</div><div class="muted">filtered out</div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <strong>Collected IDs</strong>
+    <p class="muted">One ID per line. You can copy this list or download it as a TXT file.</p>
+    <textarea id="output" spellcheck="false" placeholder="Collected asset IDs will appear here…" readonly></textarea>
+    <div class="row" style="margin-top:10px"><button id="copy" class="secondary">Copy IDs</button></div>
+  </section>
+
+  <p class="muted"><strong>API note:</strong> This uses Roblox's public catalog search endpoint from your browser. Roblox may change the endpoint, throttle requests, or block browser cross-origin requests (CORS). If that happens, the page will show an error; it does not bypass Roblox restrictions. Only use the IDs in experiences you own and are authorized to manage.</p>
+</main>
+<script>
+(() => {
+  const API = "https://catalog.roblox.com/v1/search/items/details";
+  const STORAGE_KEY = "roblox_gear_ids_v1";
+  const $ = id => document.getElementById(id);
+  const excludedTerms = /\b(gun|rifle|pistol|shotgun|sniper|weapon|sword|knife|dagger|blade|grenade|bomb|launcher|rocket|bow|crossbow|ammo|ammunition|cannon|musket|firearm)\b/i;
+
+  let ids = new Set();
+  let cursor = "";
+  let running = false;
+  let paused = false;
+  let pagesThisRun = 0;
+  let filtered = 0;
+
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+    if (Array.isArray(saved)) ids = new Set(saved.map(String).filter(x => /^\d+$/.test(x)));
+  } catch (_) {}
+  render();
+
+  function render() {
+    $("count").textContent = ids.size.toLocaleString();
+    $("pageCount").textContent = pagesThisRun.toLocaleString();
+    $("skipCount").textContent = filtered.toLocaleString();
+    $("output").value = [...ids].join("\n");
+    $("download").disabled = ids.size === 0;
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify([...ids])); } catch (_) {
+      $("status").textContent = "Browser storage is full or unavailable. Download your IDs to keep a backup.";
+    }
+  }
+
+  function setStatus(message) { $("status").textContent = message; }
+  function controls() {
+    $("start").disabled = running;
+    $("pause").disabled = !running || paused;
+    $("resume").disabled = !running || !paused;
+  }
+
+  function isExcluded(item) {
+    const text = `${item.name || ""} ${item.description || ""}`;
+    return excludedTerms.test(text);
+  }
+
+  async function collect() {
+    const maxPages = Math.max(1, Math.min(1000, Number($("pages").value) || 100));
+    const limit = Math.max(10, Math.min(30, Number($("batch").value) || 30));
+    running = true; paused = false; controls();
+    setStatus("Connecting to Roblox catalog…");
+
+    try {
+      while (running && !paused && pagesThisRun < maxPages) {
+        const params = new URLSearchParams({
+          Category: "3",
+          Subcategory: "All",
+          SortType: "3",
+          Limit: String(limit),
+          IncludeNotForSale: "true",
+          AssetTypeIds: "19"
+        });
+        if (cursor) params.set("Cursor", cursor);
+
+        const response = await fetch(`${API}?${params.toString()}`, {
+          method: "GET",
+          headers: { "Accept": "application/json" }
+        });
+        if (!response.ok) throw new Error(`Roblox returned HTTP ${response.status}.`);
+        const data = await response.json();
+        const items = Array.isArray(data.data) ? data.data : [];
+        if (!items.length) {
+          setStatus("No more results were returned by the catalog.");
+          break;
+        }
+
+        for (const item of items) {
+          const id = item.id ?? item.assetId;
+          if (id == null) continue;
+          if (isExcluded(item)) { filtered++; continue; }
+          ids.add(String(id));
+        }
+        pagesThisRun++;
+        cursor = data.nextPageCursor || "";
+        render();
+        $("progress").value = Math.min(100, pagesThisRun / maxPages * 100);
+        setStatus(`Processed page ${pagesThisRun}${cursor ? " — more results may be available." : " — catalog has no next-page cursor."}`);
+        if (!cursor) break;
+        await new Promise(resolve => setTimeout(resolve, 900));
+      }
+      if (paused) setStatus("Paused. Your IDs have been saved in this browser.");
+      else if (pagesThisRun >= maxPages) setStatus(`Stopped at your ${maxPages}-page limit. Download your IDs or increase the limit and continue.`);
+      else if (running) setStatus("Finished the available catalog pages.");
+    } catch (error) {
+      setStatus(`${error.message} Your collected IDs are preserved. Browser CORS restrictions or Roblox rate limits may prevent direct access.`);
+    } finally {
+      running = false; paused = false; controls(); render();
+    }
+  }
+
+  $("start").addEventListener("click", () => {
+    cursor = ""; pagesThisRun = 0; filtered = 0; $("progress").value = 0;
+    collect();
+  });
+  $("pause").addEventListener("click", () => {
+    paused = true; running = false; controls(); setStatus("Pausing after the current request…");
+  });
+  $("resume").addEventListener("click", () => {
+    if (running) return;
+    // Cursor is retained while this page remains open.
+    collect();
+  });
+  $("download").addEventListener("click", () => {
+    const blob = new Blob([[...ids].join("\n") + (ids.size ? "\n" : "")], {type:"text/plain;charset=utf-8"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = "roblox-gear-ids.txt"; a.click();
+    URL.revokeObjectURL(url);
+  });
+  $("clear").addEventListener("click", () => {
+    if (!confirm("Delete all saved IDs from this browser?")) return;
+    ids.clear(); cursor = ""; pagesThisRun = 0; filtered = 0; $("progress").value = 0;
+    render(); setStatus("Saved IDs cleared.");
+  });
+  $("copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText([...ids].join("\n")); setStatus("IDs copied to clipboard."); }
+    catch (_) { $("output").focus(); $("output").select(); setStatus("Select the text and copy it manually."); }
+  });
+})();
+</script>
+</body>
+</html>
